@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sitemap intencionalmente vazio: o site é particular (noindex em index.html
+  e Disallow: / em robots.txt). Não adicione URLs aqui.
+-->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>

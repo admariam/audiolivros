@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="pt-BR" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#3b5bdb" />
+    <meta name="robots" content="noindex, nofollow" />
+
+    <!--
+      URL pública do site. Se mudar o domínio (ou o nome do repositório),
+      atualize as ocorrências abaixo: canonical, og:url, og:image e twitter:image.
+    -->
+    <link rel="canonical" href="https://admariam.github.io/audiolivros/" />
+
+    <title>Audiobook Marcio — seus PDFs em audiolivro</title>
+    <meta
+      name="description"
+      content="Transforme seus PDFs em audiolivros no próprio navegador. Sem cadastro e sem servidor: a leitura em voz alta e seus livros ficam no seu aparelho."
+    />
+
+    <!-- Open Graph: cartão de link no WhatsApp, Telegram, LinkedIn e Facebook -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Audiobook Marcio" />
+    <meta property="og:locale" content="pt_BR" />
+    <meta property="og:url" content="https://admariam.github.io/audiolivros/" />
+    <meta property="og:title" content="Audiobook Marcio — seus PDFs em audiolivro" />
+    <meta
+      property="og:description"
+      content="Importe um PDF e ouça o livro em voz alta. Roda no navegador, sem cadastro."
+    />
+    <!-- TODO: trocar por uma imagem 1200×630 em public/og.png (ver design/og-image.svg) -->
+    <meta property="og:image" content="https://admariam.github.io/audiolivros/icons/icon-512.png" />
+    <meta property="og:image:width" content="512" />
+    <meta property="og:image:height" content="512" />
+    <meta property="og:image:alt" content="Audiobook Marcio" />
+
+    <!-- Twitter / X -->
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Audiobook Marcio — seus PDFs em audiolivro" />
+    <meta
+      name="twitter:description"
+      content="Importe um PDF e ouça o livro em voz alta. Roda no navegador, sem cadastro."
+    />
+    <meta name="twitter:image" content="https://admariam.github.io/audiolivros/icons/icon-512.png" />
+
+    <link rel="icon" type="image/svg+xml" href="%BASE_URL%icons/icon.svg" />
+    <link rel="manifest" href="%BASE_URL%manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="%BASE_URL%icons/icon-192.png" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Audiobook" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>
+      <div style="font-family: system-ui, sans-serif; max-width: 40rem; margin: 0 auto; padding: 2rem 1.5rem; line-height: 1.6">
+        <h1 style="font-size: 1.4rem; margin: 0 0 0.75rem">Audiobook Marcio</h1>
+        <p style="margin: 0 0 0.75rem">
+          Transforme seus PDFs em audiolivros no próprio navegador — sem cadastro e sem servidor.
+        </p>
+        <p style="margin: 0">
+          Este aplicativo precisa de JavaScript para funcionar. Habilite o JavaScript neste
+          navegador e recarregue a página para importar um PDF e ouvi-lo em voz alta.
+        </p>
+      </div>
+    </noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

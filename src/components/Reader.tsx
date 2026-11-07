@@ -1,0 +1,1144 @@
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type FormEvent,
+} from 'react';
+import type { BookMeta, Bookmark, FontKey, PageText, Preferences } from '../types';
+import {
+  addBookmark,
+  deleteBookmark,
+  getBook,
+  getBookContent,
+  getBookFile,
+  listBookmarks,
+  saveBookContent,
+  updateBook,
+} from '../lib/db';
+import { clamp, formatPercent, truncate } from '../lib/format';
+import { createId } from '../lib/ids';
+import { TEXT_VERSION, preparePageSpeech, toSpeechText } from '../lib/text';
+import { isGithubConfigComplete, loadGithubConfig } from '../lib/github';
+import {
+  flushOutbox,
+  pullBook,
+  queueUpdate,
+  scheduleFlush,
+  toSyncedBookmark,
+  withTimeout,
+  type LocalUpdate,
+} from '../lib/sync';
+import {
+  SpeechQueue,
+  type SpeechStatus,
+} from '../lib/speech';
+import {
+  createBackgroundPlayback,
+  type BackgroundPlayback,
+} from '../lib/playback';
+import type { VoicesState } from '../hooks/useVoices';
+import type { ToastTone } from './Toasts';
+import { PlayerBar } from './PlayerBar';
+import { PdfFrame } from './PdfFrame';
+import { SettingsPanel } from './SettingsPanel';
+import { BookmarksPanel } from './BookmarksPanel';
+import { ChaptersPanel } from './ChaptersPanel';
+import { HelpDialog } from './HelpDialog';
+import {
+  AlertIcon,
+  BookmarkIcon,
+  ChaptersIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  CloseIcon,
+  EyeIcon,
+  FileTextIcon,
+  KeyboardIcon,
+  MoonIcon,
+  RefreshIcon,
+  SettingsIcon,
+  SunIcon,
+} from './icons';
+
+const FONT_STACKS: Record<FontKey, string> = {
+  serif: '"Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif',
+  sans: '"Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif',
+  mono: '"Cascadia Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace',
+};
+
+interface ReaderProps {
+  bookId: string;
+  startPage?: number;
+  preferences: Preferences;
+  voices: VoicesState & { reload: () => void };
+  onPreferencesChange: (patch: Partial<Preferences>) => void;
+  onBack: () => void;
+  notify: (message: string, tone?: ToastTone) => void;
+}
+
+interface PendingSeek {
+  page: number;
+  chunkIndex: number;
+}
+
+export function Reader({
+  bookId,
+  startPage,
+  preferences,
+  voices,
+  onPreferencesChange,
+  onBack,
+  notify,
+}: ReaderProps) {
+  const [book, setBook] = useState<BookMeta | null>(null);
+  const [pages, setPages] = useState<PageText[] | null>(null);
+  const [fileUrl, setFileUrl] = useState<string | null>(null);
+  const [fileBlob, setFileBlob] = useState<Blob | null>(null);
+  const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [loadError, setLoadError] = useState('');
+  const [loadMessage, setLoadMessage] = useState('Abrindo o livro…');
+  const [page, setPage] = useState(1);
+  const [status, setStatus] = useState<SpeechStatus>('idle');
+  const [activeChunk, setActiveChunk] = useState(0);
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  const [panel, setPanel] = useState<null | 'settings' | 'bookmarks' | 'chapters' | 'help'>(null);
+  const [pageInput, setPageInput] = useState('1');
+
+  const highlightRef = useRef<HTMLElement | null>(null);
+  const pagesRef = useRef<PageText[] | null>(null);
+  const pageRef = useRef(1);
+  const bookRef = useRef<BookMeta | null>(null);
+  const preferencesRef = useRef(preferences);
+  const notifyRef = useRef(notify);
+  const queueRef = useRef<SpeechQueue | null>(null);
+  const keeperRef = useRef<BackgroundPlayback | null>(null);
+  const nextBlockRef = useRef<() => void>(() => undefined);
+  const prevBlockRef = useRef<() => void>(() => undefined);
+  const persistTimerRef = useRef<number | null>(null);
+  const latestChunkRef = useRef(0);
+  /** Última posição gravada e quando ela mudou, para só sincronizar mudanças reais. */
+  const retryPullRef = useRef(false);
+  const savedPositionRef = useRef<{ page: number; chunk: number; at: number } | null>(null);
+  const initialPageRef = useRef(1);
+  const initialChunkRef = useRef(0);
+  const pendingSeekRef = useRef<PendingSeek | null>(null);
+  const autoPlayRef = useRef(false);
+  const onPageEndRef = useRef<() => void>(() => undefined);
+  const persistRef = useRef<(mode?: 'debounce' | 'immediate' | 'complete') => Promise<void>>(
+    async () => undefined,
+  );
+
+  pagesRef.current = pages;
+  pageRef.current = page;
+  bookRef.current = book;
+  preferencesRef.current = preferences;
+  notifyRef.current = notify;
+
+  if (!queueRef.current) {
+    queueRef.current = new SpeechQueue({
+      events: {
+        onStatusChange: setStatus,
+        onChunkChange: (index) => {
+          latestChunkRef.current = index;
+          setActiveChunk(index);
+          void persistRef.current('debounce');
+        },
+        onPageEnd: () => onPageEndRef.current(),
+        onError: (message) => notifyRef.current(message, 'error'),
+      },
+      settings: {
+        rate: preferences.rate,
+        volume: preferences.volume,
+        voiceURI: preferences.voiceURI,
+      },
+    });
+  }
+
+  const queue = queueRef.current;
+
+  const prepared = useMemo(
+    () => preparePageSpeech(pages?.[page - 1]?.text ?? ''),
+    [pages, page],
+  );
+  const chunks = prepared.chunks;
+  const speechChunks = prepared.spoken;
+  const speechGaps = prepared.gaps;
+
+  /** Coloca a posição (e, se informado, os marcadores) na fila de envio ao GitHub. */
+  const queueCloud = useCallback(
+    (
+      position: Pick<LocalUpdate, 'page' | 'chunkIndex' | 'progress' | 'updatedAt'>,
+      extra: Pick<LocalUpdate, 'bookmarks' | 'deletedBookmarks'> = {},
+      delayMs = 120_000,
+    ) => {
+      const remotePath = bookRef.current?.remotePath;
+      if (!remotePath) return;
+      queueUpdate(remotePath, { ...position, ...extra });
+      scheduleFlush(delayMs);
+    },
+    [],
+  );
+
+  const persistProgress = useCallback(
+    (mode: 'debounce' | 'immediate' | 'complete' = 'debounce') => {
+      const currentPages = pagesRef.current;
+      const total = currentPages?.length ?? 0;
+      if (!total || !bookRef.current) return Promise.resolve();
+
+      const currentPage = pageRef.current;
+      const chunkCount = queueRef.current?.getChunks().length ?? 0;
+      const chunkIndex = latestChunkRef.current;
+
+      let savedPage = currentPage;
+      let savedChunk = chunkIndex;
+      let progress: number;
+
+      if (mode === 'complete') {
+        savedPage = Math.min(total, currentPage + 1);
+        savedChunk = 0;
+        progress = clamp(currentPage / total, 0, 1);
+      } else {
+        const within = chunkCount > 0 ? clamp(chunkIndex / chunkCount, 0, 1) : 0;
+        progress = clamp((currentPage - 1 + within) / total, 0, 1);
+      }
+
+      const now = Date.now();
+      const saved = savedPositionRef.current;
+      const moved = !saved || saved.page !== savedPage || saved.chunk !== savedChunk;
+
+      const save = () => {
+        const payload: Partial<BookMeta> = {
+          currentPage: savedPage,
+          lastChunkIndex: savedChunk,
+          progress,
+          lastOpenedAt: now,
+        };
+        if (moved) {
+          savedPositionRef.current = { page: savedPage, chunk: savedChunk, at: now };
+          payload.positionUpdatedAt = now;
+          queueCloud({ page: savedPage, chunkIndex: savedChunk, progress, updatedAt: now });
+        }
+        return updateBook(bookId, payload);
+      };
+
+      if (mode === 'debounce') {
+        if (persistTimerRef.current !== null) window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = window.setTimeout(() => {
+          persistTimerRef.current = null;
+          void save().catch(() => undefined);
+        }, 700);
+        return Promise.resolve();
+      }
+
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+      return save()
+        .then(() => undefined)
+        .catch(() => undefined);
+    },
+    [bookId, queueCloud],
+  );
+
+  persistRef.current = persistProgress;
+
+  onPageEndRef.current = () => {
+    const total = pagesRef.current?.length ?? 0;
+    const currentPage = pageRef.current;
+    void persistProgress('complete');
+    if (preferencesRef.current.autoAdvance && currentPage < total) {
+      autoPlayRef.current = true;
+      pendingSeekRef.current = null;
+      setPage(currentPage + 1);
+    } else if (currentPage >= total) {
+      notifyRef.current('Você chegou ao fim do livro.', 'success');
+    }
+  };
+
+  useEffect(() => {
+    let active = true;
+    let objectUrl: string | null = null;
+
+    setLoadState('loading');
+    setLoadError('');
+
+    void (async () => {
+      try {
+        const [storedBook, storedContent, blob] = await Promise.all([
+          getBook(bookId),
+          getBookContent(bookId),
+          getBookFile(bookId),
+        ]);
+
+        // Livro importado antes da leitura inteligente: refaz a extração uma vez,
+        // separando notas, cabeçalhos e números de nota. A página atual é mantida.
+        let content = storedContent;
+        if (storedBook && storedContent && blob && (storedContent.textVersion ?? 1) < TEXT_VERSION) {
+          if (active) setLoadMessage('Preparando a leitura deste livro… (só desta vez)');
+          try {
+            const pdf = await import('../lib/pdf');
+            const parsed = await pdf.parsePdf(new File([blob], storedBook.fileName, { type: 'application/pdf' }), {
+              fileName: storedBook.fileName,
+              onProgress: (current, total) => {
+                if (active) setLoadMessage(`Preparando a leitura deste livro… ${Math.round((current / total) * 100)}%`);
+              },
+            });
+            if (parsed.pages.length === storedContent.pages.length) {
+              content = { ...storedContent, pages: parsed.pages, extractedAt: Date.now(), textVersion: TEXT_VERSION };
+              await saveBookContent(content);
+            }
+          } catch {
+            content = storedContent;
+          }
+        }
+
+        // Traz do GitHub a página onde parou em outro aparelho, sem travar se estiver offline.
+        let loadedBook = storedBook;
+        const cloud = loadGithubConfig();
+        if (storedBook?.remotePath && isGithubConfigComplete(cloud) && !startPage) {
+          try {
+            await withTimeout(flushOutbox(cloud), 4000);
+            loadedBook = await withTimeout(pullBook(cloud, storedBook), 5000);
+          } catch {
+            // Rede lenta: abre com a posição local e confere de novo em segundo plano.
+            loadedBook = (await getBook(bookId)) ?? storedBook;
+            retryPullRef.current = true;
+          }
+        }
+
+        if (!loadedBook || !content || !blob) {
+          throw new Error('Este livro não está mais disponível neste dispositivo.');
+        }
+        if (content.pages.length === 0) {
+          throw new Error('Não há páginas armazenadas para este livro.');
+        }
+        if (!active) return;
+
+        let targetPage = clamp(
+          startPage ?? loadedBook.currentPage ?? 1,
+          1,
+          content.pages.length,
+        );
+        // Livro ainda não lido: em vez de parar na capa (sem texto), abre na primeira página com texto.
+        const neverRead = !loadedBook.positionUpdatedAt && (loadedBook.currentPage ?? 1) <= 1;
+        if (!startPage && neverRead && !toSpeechText(content.pages[targetPage - 1]?.text ?? '')) {
+          const firstText = content.pages.findIndex((item) => toSpeechText(item.text));
+          if (firstText >= 0) targetPage = firstText + 1;
+        }
+        initialPageRef.current = targetPage;
+        initialChunkRef.current = startPage
+          ? 0
+          : Math.max(0, loadedBook.lastChunkIndex ?? 0);
+
+        savedPositionRef.current = {
+          page: clamp(loadedBook.currentPage ?? 1, 1, content.pages.length),
+          chunk: Math.max(0, loadedBook.lastChunkIndex ?? 0),
+          at: loadedBook.positionUpdatedAt ?? 0,
+        };
+
+        objectUrl = URL.createObjectURL(blob);
+        const openedBook: BookMeta = { ...loadedBook, lastOpenedAt: Date.now() };
+        setBook(openedBook);
+        setBookmarks(await listBookmarks(bookId));
+        setPages(content.pages);
+        setFileUrl(objectUrl);
+        setFileBlob(blob);
+        setPage(targetPage);
+        setLoadState('ready');
+        void updateBook(bookId, { lastOpenedAt: openedBook.lastOpenedAt }).catch(() => undefined);
+      } catch (error) {
+        if (!active) return;
+        setLoadError(
+          error instanceof Error
+            ? error.message
+            : 'Não foi possível abrir este livro. Ele pode ter sido removido do navegador.',
+        );
+        setLoadState('error');
+      }
+    })();
+
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [bookId, startPage]);
+
+  useEffect(() => {
+    if (!pages || loadState !== 'ready') return;
+    const pending = pendingSeekRef.current;
+    let start = 0;
+    if (pending && pending.page === page) {
+      start =
+        pending.chunkIndex < 0
+          ? Math.max(0, speechChunks.length - 1)
+          : Math.min(pending.chunkIndex, Math.max(0, speechChunks.length - 1));
+    } else if (page === initialPageRef.current) {
+      start = Math.min(initialChunkRef.current, Math.max(0, speechChunks.length - 1));
+    }
+    pendingSeekRef.current = null;
+    queue.load(speechChunks, start, speechGaps);
+    latestChunkRef.current = start;
+    setActiveChunk(start);
+    void persistProgress('immediate');
+    if (autoPlayRef.current) {
+      if (speechChunks.length === 0) {
+        // Página sem texto (capa, ilustração, página em branco): segue para a próxima com texto.
+        const all = pages;
+        let target: number | null = null;
+        for (let index = page + 1; index <= all.length; index += 1) {
+          if (toSpeechText(all[index - 1]?.text ?? '')) {
+            target = index;
+            break;
+          }
+        }
+        if (target) {
+          pendingSeekRef.current = { page: target, chunkIndex: 0 };
+          setPage(target);
+          return;
+        }
+        autoPlayRef.current = false;
+        notifyRef.current('Você chegou ao fim do texto do livro.', 'success');
+        return;
+      }
+      autoPlayRef.current = false;
+      queue.play();
+    }
+  }, [pages, page, speechChunks, speechGaps, queue, persistProgress, loadState]);
+
+  useEffect(() => {
+    queue.setSettings({
+      rate: preferences.rate,
+      volume: preferences.volume,
+      voiceURI: preferences.voiceURI,
+    });
+  }, [queue, preferences.rate, preferences.volume, preferences.voiceURI]);
+
+  // Sessão de mídia: tela de bloqueio, fones e botões do sistema.
+  useEffect(() => {
+    const keeper = createBackgroundPlayback({
+      onPlay: () => {
+        const current = queueRef.current;
+        if (current && current.getStatus() !== 'playing') current.play();
+      },
+      onPause: () => queueRef.current?.pause(),
+      onNext: () => nextBlockRef.current(),
+      onPrevious: () => prevBlockRef.current(),
+    });
+    keeperRef.current = keeper;
+    return () => {
+      keeper.dispose();
+      keeperRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const keeper = keeperRef.current;
+    if (!keeper) return;
+    if (status === 'playing') keeper.start();
+    else keeper.stop();
+  }, [status]);
+
+  useEffect(() => {
+    const keeper = keeperRef.current;
+    if (!keeper) return;
+    keeper.setMetadata({
+      title: book?.title ?? 'Audiobook Marcio',
+      artist: book?.author ?? 'Audiobook Marcio',
+      album: pages ? `Página ${page} de ${pages.length}` : '',
+    });
+  }, [book, page, pages]);
+
+  // Voltou do segundo plano: se a fala foi suspensa pelo sistema, retoma.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (queueRef.current?.getStatus() === 'playing') queueRef.current.resumeIfNeeded();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      queue.dispose();
+      if (persistTimerRef.current !== null) window.clearTimeout(persistTimerRef.current);
+    };
+  }, [queue]);
+
+  useEffect(() => {
+    if (!book) return;
+    const previousTitle = document.title;
+    document.title = `${book.title} — Audiobook Marcio`;
+    return () => {
+      document.title = previousTitle;
+    };
+  }, [book]);
+
+  useEffect(() => {
+    setPageInput(String(page));
+  }, [page]);
+
+  useEffect(() => {
+    if (status !== 'playing') return;
+    const element = highlightRef.current;
+    if (!element) return;
+    const reduceMotion =
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    element.scrollIntoView({ block: 'center', behavior: reduceMotion ? 'auto' : 'smooth' });
+  }, [activeChunk, status]);
+
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        void persistProgress('immediate').then(() => flushOutbox());
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, [persistProgress]);
+
+  const changePage = useCallback(
+    (target: number, options: { autoplay?: boolean; seekChunk?: number | 'last' } = {}) => {
+      const total = pagesRef.current?.length ?? 0;
+      if (total === 0) return;
+      const clamped = clamp(Math.round(target), 1, total);
+      const wasPlaying = queueRef.current?.getStatus() === 'playing';
+      const autoplay = options.autoplay ?? wasPlaying;
+
+      if (clamped === pageRef.current) {
+        if (options.seekChunk !== undefined) {
+          const index =
+            options.seekChunk === 'last'
+              ? Math.max(0, (queueRef.current?.getChunks().length ?? 1) - 1)
+              : options.seekChunk;
+          queueRef.current?.seekToChunk(index, autoplay);
+        }
+        return;
+      }
+
+      autoPlayRef.current = autoplay;
+      pendingSeekRef.current =
+        options.seekChunk !== undefined
+          ? { page: clamped, chunkIndex: options.seekChunk === 'last' ? -1 : options.seekChunk }
+          : null;
+      queueRef.current?.stop();
+      setPage(clamped);
+    },
+    [],
+  );
+
+  /**
+   * Ao voltar para o app (celular desbloqueado, aba reaberta), confere no GitHub
+   * se o livro avançou em outro aparelho e pula para lá, desde que não esteja tocando.
+   */
+  const lastRemoteCheckRef = useRef(0);
+  const catchUpRef = useRef<() => Promise<void>>(async () => undefined);
+  useEffect(() => {
+    const catchUp = async () => {
+      if (document.visibilityState !== 'visible') return;
+      if (queueRef.current?.getStatus() === 'playing') return;
+      const current = bookRef.current;
+      const cloud = loadGithubConfig();
+      if (!current?.remotePath || !isGithubConfigComplete(cloud)) return;
+      if (Date.now() - lastRemoteCheckRef.current < 10_000) return;
+      lastRemoteCheckRef.current = Date.now();
+
+      try {
+        await withTimeout(flushOutbox(cloud), 4000);
+        const fresh = await getBook(current.id);
+        if (!fresh) return;
+        const before = savedPositionRef.current?.at ?? 0;
+        const updated = await withTimeout(
+          pullBook(cloud, { ...fresh, positionUpdatedAt: Math.max(before, fresh.positionUpdatedAt ?? 0) }),
+          5000,
+        );
+        setBookmarks(await listBookmarks(current.id));
+        const at = updated.positionUpdatedAt ?? 0;
+        if (at <= before || queueRef.current?.getStatus() === 'playing') return;
+        savedPositionRef.current = { page: updated.currentPage, chunk: updated.lastChunkIndex, at };
+        setBook((previous) => (previous ? { ...previous, ...updated } : previous));
+        if (updated.currentPage !== pageRef.current || updated.lastChunkIndex !== latestChunkRef.current) {
+          changePage(updated.currentPage, { seekChunk: updated.lastChunkIndex, autoplay: false });
+          notifyRef.current(
+            `Continuando da página ${updated.currentPage}, onde você parou em outro aparelho.`,
+            'info',
+          );
+        }
+      } catch {
+        // sem internet: segue na posição deste aparelho
+      }
+    };
+    catchUpRef.current = catchUp;
+    const onVisible = () => void catchUp();
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onVisible);
+    };
+  }, [changePage]);
+
+  useEffect(() => {
+    if (loadState !== 'ready' || !retryPullRef.current) return;
+    retryPullRef.current = false;
+    lastRemoteCheckRef.current = 0;
+    void catchUpRef.current();
+  }, [loadState]);
+
+  const handleBack = async () => {
+    queue.stop();
+    await persistProgress('immediate');
+    void flushOutbox();
+    onBack();
+  };
+
+  /** Envia ao GitHub a lista atual de marcadores deste livro. */
+  const syncBookmarks = (list: Bookmark[], deletedId?: string) => {
+    const current = bookRef.current;
+    if (!current?.remotePath) return;
+    const total = pagesRef.current?.length ?? current.pageCount;
+    const saved = savedPositionRef.current ?? { page: pageRef.current, chunk: latestChunkRef.current, at: 0 };
+    queueCloud(
+      {
+        page: saved.page,
+        chunkIndex: saved.chunk,
+        progress: total > 0 ? clamp((saved.page - 1) / total, 0, 1) : 0,
+        updatedAt: saved.at,
+      },
+      {
+        bookmarks: list.map(toSyncedBookmark),
+        deletedBookmarks: deletedId ? [deletedId] : undefined,
+      },
+      3000,
+    );
+  };
+
+  /** Próxima página (a partir de `from`) que tem texto para ler; capas e páginas em branco são puladas. */
+  const findReadablePage = (from: number): number | null => {
+    const all = pagesRef.current ?? [];
+    for (let index = Math.max(1, from); index <= all.length; index += 1) {
+      if (toSpeechText(all[index - 1]?.text ?? '')) return index;
+    }
+    return null;
+  };
+
+  const togglePlayback = () => {
+    if (!queue.isSupported()) {
+      notify(
+        'A síntese de voz não está disponível neste navegador. Você ainda pode ler o texto na tela.',
+        'error',
+      );
+      return;
+    }
+    if (speechChunks.length === 0 && status !== 'playing') {
+      const target = findReadablePage(page + 1);
+      if (target) {
+        changePage(target, { autoplay: true, seekChunk: 0 });
+      } else {
+        notify('Não há mais texto para ler a partir desta página.', 'info');
+      }
+      return;
+    }
+    if (queue.getIndex() >= speechChunks.length && speechChunks.length > 0) {
+      queue.load(speechChunks, 0);
+    }
+    queue.toggle();
+  };
+
+  const playFromStart = () => {
+    if (speechChunks.length === 0) return;
+    queue.seekToChunk(0, true);
+  };
+
+  const nextBlock = () => {
+    const index = queue.getIndex();
+    if (index >= speechChunks.length - 1) {
+      if (page < (pages?.length ?? 1)) {
+        changePage(page + 1, { autoplay: status === 'playing' });
+      } else {
+        notify('Você está no último bloco da última página.', 'info');
+      }
+      return;
+    }
+    queue.next();
+  };
+
+  const prevBlock = () => {
+    if (queue.getIndex() <= 0) {
+      if (page > 1) {
+        changePage(page - 1, { seekChunk: 'last', autoplay: status === 'playing' });
+      }
+      return;
+    }
+    queue.previous();
+  };
+
+  nextBlockRef.current = nextBlock;
+  prevBlockRef.current = prevBlock;
+
+  const bookmarkCurrent = async () => {
+    if (!book) return;
+    const index = Math.min(
+      Math.max(activeChunk, 0),
+      Math.max(0, speechChunks.length - 1),
+    );
+    const snippet =
+      speechChunks[index] ??
+      (pages?.[page - 1]?.text ?? '').replace(/\s+/g, ' ').trim();
+    const label = snippet ? truncate(snippet, 80) : 'Página sem texto';
+
+    try {
+      await addBookmark({
+        id: createId(),
+        bookId,
+        page,
+        chunkIndex: index,
+        label,
+        createdAt: Date.now(),
+      });
+      const updated = await listBookmarks(bookId);
+      setBookmarks(updated);
+      syncBookmarks(updated);
+      notify('Marcador adicionado nesta posição.', 'success');
+    } catch {
+      notify('Não foi possível salvar o marcador.', 'error');
+    }
+  };
+
+  const removeBookmark = async (bookmark: Bookmark) => {
+    try {
+      await deleteBookmark(bookmark.id);
+      const updated = await listBookmarks(bookId);
+      setBookmarks(updated);
+      syncBookmarks(updated, bookmark.id);
+      notify('Marcador removido.', 'success');
+    } catch {
+      notify('Não foi possível remover o marcador.', 'error');
+    }
+  };
+
+  const toggleTheme = () => {
+    onPreferencesChange({ theme: preferences.theme === 'dark' ? 'light' : 'dark' });
+  };
+
+  const toggleView = () => {
+    onPreferencesChange({ viewMode: preferences.viewMode === 'pdf' ? 'text' : 'pdf' });
+  };
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target?.closest('input, textarea, select, [contenteditable="true"]')) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (panel) return;
+
+      const isButton = target?.closest('button, a');
+      if (isButton && (event.key === ' ' || event.key === 'Enter')) return;
+
+      switch (event.key) {
+        case ' ':
+        case 'k':
+        case 'K':
+          event.preventDefault();
+          togglePlayback();
+          break;
+        case 'ArrowRight':
+          event.preventDefault();
+          nextBlock();
+          break;
+        case 'ArrowLeft':
+          event.preventDefault();
+          prevBlock();
+          break;
+        case 'PageDown':
+          event.preventDefault();
+          changePage(pageRef.current + 1);
+          break;
+        case 'PageUp':
+          event.preventDefault();
+          changePage(pageRef.current - 1);
+          break;
+        case 'm':
+        case 'M':
+          event.preventDefault();
+          void bookmarkCurrent();
+          break;
+        case 't':
+        case 'T':
+          event.preventDefault();
+          toggleTheme();
+          break;
+        case 'v':
+        case 'V':
+          event.preventDefault();
+          toggleView();
+          break;
+        case '?':
+          event.preventDefault();
+          setPanel('help');
+          break;
+        default:
+          break;
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  });
+
+  const handlePageSubmit = (event: FormEvent) => {
+    event.preventDefault();
+    const parsed = Number(pageInput);
+    if (!Number.isFinite(parsed)) {
+      setPageInput(String(page));
+      return;
+    }
+    changePage(parsed);
+  };
+
+  const totalPages = pages?.length ?? book?.pageCount ?? 0;
+  const pageText = pages?.[page - 1]?.text ?? '';
+  const pageNotes = pages?.[page - 1]?.notes ?? '';
+  const activeTextChunk = chunks[activeChunk];
+
+  /**
+   * Quando o bloco é praticamente a página inteira (páginas de título, folhas
+   * de rosto), pintá-lo não informa nada e ainda cobre o texto de faixas.
+   * Nesse caso o destaque é omitido; o player continua mostrando o trecho.
+   */
+  const highlightChunk =
+    status !== 'idle' &&
+    activeTextChunk !== undefined &&
+    activeTextChunk.start < activeTextChunk.end &&
+    activeTextChunk.end - activeTextChunk.start < pageText.length * 0.8
+      ? activeTextChunk
+      : null;
+  const currentChapter = useMemo(() => {
+    if (!book) return null;
+    return [...book.chapters].reverse().find((chapter) => chapter.page <= page) ?? null;
+  }, [book, page]);
+  const overallProgress = totalPages > 0 ? clamp((page - 1) / totalPages, 0, 1) : 0;
+  const fontStyle: CSSProperties = {
+    fontFamily: FONT_STACKS[preferences.fontFamily],
+    fontSize: `${preferences.fontSize}px`,
+    lineHeight: preferences.lineHeight,
+  };
+
+  if (loadState === 'loading') {
+    return (
+      <div className="reader-state">
+        <span className="spinner" aria-hidden="true" />
+        <p role="status">{loadMessage}</p>
+      </div>
+    );
+  }
+
+  if (loadState === 'error' || !book) {
+    return (
+      <div className="reader-state reader-state--error">
+        <AlertIcon size={32} />
+        <h1>Não foi possível abrir o livro</h1>
+        <p>{loadError}</p>
+        <button type="button" className="button button--primary" onClick={onBack}>
+          Voltar para a biblioteca
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="reader">
+      <header className="reader__header">
+        <button type="button" className="button button--ghost reader__back" onClick={() => void handleBack()}>
+          <ChevronLeftIcon /> <span>Biblioteca</span>
+        </button>
+
+        <div className="reader__title-block">
+          <h1 className="reader__title">{book.title}</h1>
+          <p className="reader__subtitle">
+            {currentChapter ? `${truncate(currentChapter.title, 42)} · ` : ''}
+            {book.author ? `${book.author} · ` : ''}
+            {formatPercent(book.pageCount > 0 ? overallProgress : 0)} do livro
+          </p>
+        </div>
+      </header>
+
+      <nav className="reader__rail" aria-label="Ações do leitor">
+          <button
+            type="button"
+            className="icon-button"
+            onClick={toggleView}
+            aria-label={preferences.viewMode === 'pdf' ? 'Mostrar texto' : 'Mostrar PDF original'}
+            aria-pressed={preferences.viewMode === 'pdf'}
+            title="Alternar texto/PDF (V)"
+          >
+            {preferences.viewMode === 'pdf' ? <FileTextIcon /> : <EyeIcon />}
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={() => setPanel('chapters')}
+            aria-label="Abrir capítulos"
+            title="Capítulos"
+          >
+            <ChaptersIcon />
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={() => setPanel('bookmarks')}
+            aria-label={`Abrir marcadores (${bookmarks.length})`}
+            title="Marcadores"
+          >
+            <BookmarkIcon />
+            {bookmarks.length > 0 ? (
+              <span className="icon-button__badge" aria-hidden="true">
+                {bookmarks.length}
+              </span>
+            ) : null}
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={toggleTheme}
+            aria-label={preferences.theme === 'dark' ? 'Ativar tema claro' : 'Ativar tema escuro'}
+            title="Alternar tema (T)"
+          >
+            {preferences.theme === 'dark' ? <SunIcon /> : <MoonIcon />}
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={() => setPanel('settings')}
+            aria-label="Abrir configurações"
+            title="Configurações"
+          >
+            <SettingsIcon />
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={() => setPanel('help')}
+            aria-label="Atalhos de teclado"
+            title="Atalhos de teclado"
+          >
+            <KeyboardIcon />
+          </button>
+      </nav>
+
+      {book.needsOcr ? (
+        <div className="banner banner--warning" role="status">
+          <AlertIcon />
+          <div>
+            <strong>PDF sem texto extraível (possivelmente digitalizado)</strong>
+            <p>
+              Este aplicativo não inclui OCR. A leitura em voz alta pode ficar vazia; use a
+              visualização do PDF original ou converta o arquivo em um PDF com texto antes de
+              importar novamente.
+            </p>
+            <button type="button" className="link-button" onClick={() => onPreferencesChange({ viewMode: 'pdf' })}>
+              Ver PDF original
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {!voices.supported ? (
+        <div className="banner banner--info" role="status">
+          <AlertIcon />
+          <div>
+            <strong>Reprodução em voz alta indisponível</strong>
+            <p>
+              Este navegador não oferece a Web Speech API. O texto continua acessível para
+              leitura na tela.
+            </p>
+          </div>
+        </div>
+      ) : null}
+
+      <main className="reader__body">
+        {preferences.viewMode === 'pdf' && fileUrl ? (
+          <PdfFrame objectUrl={fileUrl} file={fileBlob} page={page} title={book.title} />
+        ) : (
+          <article className="page-reader" aria-label={`Página ${page} de ${totalPages}`}>
+            <div className="page-reader__meta">
+              <form className="page-jump page-jump--inline" onSubmit={handlePageSubmit}>
+                <label htmlFor="page-jump-input" className="visually-hidden">
+                  Ir para a página
+                </label>
+                <input
+                  id="page-jump-input"
+                  type="number"
+                  min={1}
+                  max={totalPages}
+                  value={pageInput}
+                  onChange={(event) => setPageInput(event.target.value)}
+                  className="page-jump__input"
+                />
+                <span className="page-reader__total">de {totalPages}</span>
+              </form>
+              {speechChunks.length > 0 ? (
+                <span className="page-reader__paragraph">
+                  {status === 'playing' ? (
+                    <span className="status-dot status-dot--playing" aria-hidden="true" />
+                  ) : null}
+                  Parágrafo {Math.min(activeChunk + 1, speechChunks.length)} de{' '}
+                  {speechChunks.length}
+                </span>
+              ) : null}
+            </div>
+
+            {pageText.trim() ? (
+              <div className="page-text" style={fontStyle}>
+                {highlightChunk ? (
+                  <>
+                    {pageText.slice(0, highlightChunk.start)}
+                    <mark
+                      ref={(element) => {
+                        highlightRef.current = element;
+                      }}
+                      className="reading-highlight"
+                    >
+                      {pageText.slice(highlightChunk.start, highlightChunk.end)}
+                    </mark>
+                    {pageText.slice(highlightChunk.end)}
+                  </>
+                ) : (
+                  pageText
+                )}
+              </div>
+            ) : (
+              <div className="page-empty">
+                <FileTextIcon size={34} />
+                <h2>Esta página não tem texto extraível</h2>
+                <p>
+                  Provavelmente ela é uma imagem digitalizada. O aplicativo não realiza OCR, então
+                  não há texto para ouvir. Você pode visualizar o PDF original.
+                </p>
+                <button
+                  type="button"
+                  className="button button--secondary"
+                  onClick={() => onPreferencesChange({ viewMode: 'pdf' })}
+                >
+                  <EyeIcon /> Ver PDF original
+                </button>
+              </div>
+            )}
+
+            {pageNotes ? (
+              <aside className="page-notes" aria-label="Notas desta página">
+                <span className="page-notes__title">Notas da página (não são lidas em voz alta)</span>
+                <p>{pageNotes}</p>
+              </aside>
+            ) : null}
+
+            <div className="page-reader__footer">
+              <div className="page-nav">
+                <button
+                  type="button"
+                  className="icon-button"
+                  onClick={() => changePage(page - 1)}
+                  disabled={page <= 1}
+                  aria-label="Página anterior"
+                >
+                  <ChevronLeftIcon />
+                </button>
+                <span className="page-nav__label" aria-live="polite">
+                  Página <strong>{page}</strong> de {totalPages}
+                </span>
+                <button
+                  type="button"
+                  className="icon-button"
+                  onClick={() => changePage(page + 1)}
+                  disabled={page >= totalPages}
+                  aria-label="Próxima página"
+                >
+                  <ChevronRightIcon />
+                </button>
+              </div>
+              {speechChunks.length > 0 ? (
+                <button
+                  type="button"
+                  className="button button--secondary"
+                  onClick={status === 'playing' ? () => queue.pause() : playFromStart}
+                >
+                  {status === 'playing' ? (
+                    <>
+                      <CloseIcon size={16} /> Pausar
+                    </>
+                  ) : (
+                    <>
+                      <RefreshIcon size={16} /> Ler esta página do início
+                    </>
+                  )}
+                </button>
+              ) : null}
+            </div>
+          </article>
+        )}
+      </main>
+
+      <p className="visually-hidden" aria-live="polite">
+        {status === 'playing'
+          ? `Reproduzindo página ${page}, parágrafo ${Math.min(activeChunk + 1, Math.max(speechChunks.length, 1))} de ${speechChunks.length}.`
+          : status === 'paused'
+            ? 'Reprodução pausada.'
+            : ''}
+      </p>
+
+      <PlayerBar
+        status={status}
+        rate={preferences.rate}
+        onToggle={togglePlayback}
+        onStop={() => {
+          queue.stop();
+        }}
+        onPrevChunk={prevBlock}
+        onNextChunk={nextBlock}
+      />
+
+      {panel === 'settings' ? (
+        <SettingsPanel
+          preferences={preferences}
+          voices={voices}
+          onChange={onPreferencesChange}
+          onReloadVoices={voices.reload}
+          onClose={() => setPanel(null)}
+        />
+      ) : null}
+
+      {panel === 'bookmarks' ? (
+        <BookmarksPanel
+          bookmarks={bookmarks}
+          onJump={(bookmark) => {
+            setPanel(null);
+            changePage(bookmark.page, {
+              seekChunk: bookmark.chunkIndex,
+              autoplay: status === 'playing',
+            });
+          }}
+          onDelete={(bookmark) => void removeBookmark(bookmark)}
+          onClose={() => setPanel(null)}
+        />
+      ) : null}
+
+      {panel === 'chapters' ? (
+        <ChaptersPanel
+          chapters={book.chapters}
+          currentPage={page}
+          onJump={(chapter) => {
+            setPanel(null);
+            changePage(chapter.page, { autoplay: status === 'playing' });
+          }}
+          onClose={() => setPanel(null)}
+        />
+      ) : null}
+
+      {panel === 'help' ? <HelpDialog onClose={() => setPanel(null)} /> : null}
+    </div>
+  );
+}

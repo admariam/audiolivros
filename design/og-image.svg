@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="Audiobook Marcio — seus PDFs em audiolivro">
+  <!--
+    Fonte da imagem de compartilhamento (Open Graph), 1200×630.
+    Exporte como PNG e salve em public/og.png; depois troque og:image e
+    twitter:image no index.html para .../audiolivros/og.png e mude
+    twitter:card para summary_large_image.
+  -->
+  <rect width="1200" height="630" fill="#fbf8f1"/>
+
+  <g transform="translate(84 96) scale(0.36)">
+    <g fill="none" stroke="#d4a017" stroke-width="20" stroke-linecap="round">
+      <path d="M144 172a112 96 0 0 1 224 0"/>
+      <path d="M188 182a68 58 0 0 1 136 0"/>
+    </g>
+    <path d="M48 304c70-30 150-26 202 12 52-38 132-42 202-12v124c-70-26-150-22-190 12l-6 4-6-4c-40-34-120-38-190-12z" fill="#143a6d"/>
+    <path d="M48 428c70-26 150-22 202 12v-22C198 384 118 380 48 406z" fill="#f1e0b4"/>
+    <path d="M452 428c-70-26-150-22-202 12v-22c52-34 132-38 202-12z" fill="#f1e0b4"/>
+    <g fill="#d4a017">
+      <rect x="243" y="200" width="26" height="240" rx="7"/>
+      <rect x="192" y="262" width="128" height="26" rx="7"/>
+    </g>
+  </g>
+
+  <text x="84" y="400" font-family="Georgia, 'Times New Roman', serif" font-size="72" font-weight="700" fill="#143a6d" letter-spacing="-1.5">
+    Audiobook Marcio
+  </text>
+
+  <text x="84" y="458" font-family="'Segoe UI', system-ui, sans-serif" font-size="32" fill="#5c564e">
+    Seus PDFs viram audiolivro no próprio navegador.
+  </text>
+
+  <g font-family="'Segoe UI', system-ui, sans-serif" font-size="25" fill="#6b6459">
+    <text x="84" y="524">Sem cadastro</text>
+    <text x="286" y="524">Sem servidor</text>
+    <text x="496" y="524">Funciona offline</text>
+  </g>
+
+  <rect x="84" y="556" width="110" height="4" rx="2" fill="#d4a017"/>
+
+  <text x="84" y="600" font-family="'Segoe UI', system-ui, sans-serif" font-size="23" fill="#8a8074">
+    admariam.github.io/audiolivros
+  </text>
+</svg>

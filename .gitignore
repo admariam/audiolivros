@@ -1,0 +1,14 @@
+node_modules
+dist
+dist-ssr
+*.local
+.DS_Store
+Thumbs.db
+coverage
+.vite
+*.log
+# Nunca versionar PDFs pessoais
+*.pdf
+!public/**/*.pdf
+# livros/ guarda PDFs e o progresso.json: mora no repositório privado
+/livros/
